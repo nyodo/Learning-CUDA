@@ -518,6 +518,40 @@ half `9.226470 -> 9.285083 ms`。实验中强制 half warp 路径会从 `1.65714
 也没有把 S5000 dispatch 照搬过去。恢复访问后从包含 Moore 提交的最新 master 开始，
 按下面步骤独立探测和调参。
 
+### 13.1 提交前兼容性复验
+
+2026-08-12 再次尝试现有入口，连接超时，仍未获得可用 MXMACA shell。根据沐曦官方
+`mxcc` 编译器指南，`.maca` 是包含 host/device 代码的原生 MXMACA 源文件，支持直接
+使用 `mxcc -c src/kernels.maca` 编译；单独链接目标文件时不应再传 `-x maca`。本仓库
+Makefile 正是分别执行编译和链接，因此文件后缀与构建拓扑符合官方工具链约定：
+
+<https://developer.metax-tech.com/doc/215>
+
+本轮对最终候选文件重新执行 CUDA 等价映射，而不是沿用旧日志。只替换 half 头文件与
+`mc* -> cuda*` Runtime 名称，kernel、模板、索引、分配布局和 host 生命周期保持不变。
+结果如下：
+
+| 复验项 | 结果 |
+|---|---:|
+| 默认 `-O0` 官方 RMSNorm | float/half 26/26 |
+| 默认 `-O0` 官方 Attention | float/half 28/28 |
+| `-O3 -arch=sm_120` 官方 RMSNorm | float/half 26/26 |
+| `-O3 -arch=sm_120` 官方 Attention | float/half 28/28 |
+| 扩展 RMSNorm | float/half 各 7/7 |
+| 扩展 Attention | float/half 各 5/5 |
+| 空 KV、空 RMS、溢出边界 | 通过 |
+| Compute Sanitizer memcheck/initcheck/synccheck | 0 error |
+| Compute Sanitizer racecheck | 0 hazard，0 warning |
+
+额外将空 KV 输出从按字节 `memset` 改为类型安全的 `std::fill(T{})`，避免依赖 half 的
+全零对象表示，也让字节数不再经过未单独校验的乘法。正式 MetaX 实现继续坚持不依赖
+wave shuffle、ballot、WMMA 或平台汇编：RMSNorm 使用 64/128/256 线程 shared-memory
+规约；Attention 使用一线程一 query 的 float 稳定三遍和 half FP32 online softmax。
+
+这些结果足以证明数学、索引、模板实例、边界检查和 CUDA 风格 kernel 语法一致，但仍
+不能证明真实 `mxcc` 版本的头文件兼容性、设备 ABI、资源占用或性能。因此本次提交把
+MetaX 明确标为“较大概率可编译的正确性基线”，而不是“真机验证完成”。
+
 环境记录：
 
 ```bash

@@ -1,7 +1,350 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
+
+namespace {
+
+constexpr size_t kDeviceAlignment = 256;
+constexpr int kMaxAttentionHeadDim = 256;
+constexpr int kAttentionBlockSize = 128;
+constexpr float kNegativeFloatMax = -3.402823466e+38F;
+
+template <typename T>
+__device__ __forceinline__ float toFloat(T value);
+
+template <>
+__device__ __forceinline__ float toFloat<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __forceinline__ float toFloat<half>(half value) {
+  return __half2float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T fromFloat(float value);
+
+template <>
+__device__ __forceinline__ float fromFloat<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __forceinline__ half fromFloat<half>(float value) {
+  return __float2half_rn(value);
+}
+
+size_t checkedMultiply(size_t lhs, size_t rhs, const char* label) {
+  if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+    throw std::overflow_error(label);
+  }
+  return lhs * rhs;
+}
+
+size_t checkedAdd(size_t lhs, size_t rhs, const char* label) {
+  if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+    throw std::overflow_error(label);
+  }
+  return lhs + rhs;
+}
+
+size_t alignDeviceOffset(size_t value) {
+  return checkedAdd(value, kDeviceAlignment - 1,
+                    "device allocation alignment overflow") &
+         ~(kDeviceAlignment - 1);
+}
+
+template <typename T, int BlockSize>
+__global__ void rmsNormKernel(const T* __restrict__ input,
+                              const T* __restrict__ weight,
+                              T* __restrict__ output, size_t hidden_dim,
+                              float eps) {
+  __shared__ float partial_sums[BlockSize];
+  __shared__ float inv_rms;
+
+  const size_t row_offset = static_cast<size_t>(blockIdx.x) * hidden_dim;
+  float sum_squares = 0.0F;
+  for (size_t col = threadIdx.x; col < hidden_dim; col += BlockSize) {
+    const float value = toFloat(input[row_offset + col]);
+    sum_squares = fmaf(value, value, sum_squares);
+  }
+
+  partial_sums[threadIdx.x] = sum_squares;
+  __syncthreads();
+  for (int stride = BlockSize / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partial_sums[threadIdx.x] += partial_sums[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    inv_rms = rsqrtf(partial_sums[0] / static_cast<float>(hidden_dim) + eps);
+  }
+  __syncthreads();
+
+  for (size_t col = threadIdx.x; col < hidden_dim; col += BlockSize) {
+    const float value = toFloat(input[row_offset + col]);
+    const float scale = toFloat(weight[col]);
+    output[row_offset + col] = fromFloat<T>(value * inv_rms * scale);
+  }
+}
+
+template <typename T>
+void launchRmsNorm(const T* input, const T* weight, T* output, size_t rows,
+                   size_t hidden_dim, float eps) {
+  const unsigned int blocks = static_cast<unsigned int>(rows);
+  if (hidden_dim <= 64) {
+    rmsNormKernel<T, 64><<<blocks, 64>>>(input, weight, output, hidden_dim,
+                                         eps);
+  } else if (hidden_dim <= 128) {
+    rmsNormKernel<T, 128><<<blocks, 128>>>(input, weight, output, hidden_dim,
+                                           eps);
+  } else {
+    rmsNormKernel<T, 256><<<blocks, 256>>>(input, weight, output, hidden_dim,
+                                           eps);
+  }
+}
+
+template <int HeadDim>
+__global__ void flashAttentionFloatThreePassKernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ output,
+    size_t query_rows, int target_seq_len, int src_seq_len, int query_heads,
+    int kv_heads, int runtime_head_dim, bool is_causal) {
+  const size_t query_row = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                           threadIdx.x;
+  if (query_row >= query_rows) {
+    return;
+  }
+
+  enum {
+    kStorageDim = HeadDim == 0 ? kMaxAttentionHeadDim : HeadDim
+  };
+  const int head_dim = HeadDim == 0 ? runtime_head_dim : HeadDim;
+  const size_t rows_per_batch =
+      static_cast<size_t>(target_seq_len) * query_heads;
+  const int batch = static_cast<int>(query_row / rows_per_batch);
+  const size_t row_in_batch =
+      query_row - static_cast<size_t>(batch) * rows_per_batch;
+  const int query_pos = static_cast<int>(row_in_batch / query_heads);
+  const int query_head = static_cast<int>(row_in_batch % query_heads);
+  const int kv_head = query_head / (query_heads / kv_heads);
+  const size_t q_offset = query_row * head_dim;
+  const int causal_end = query_pos + 1;
+  const int key_end =
+      is_causal && causal_end < src_seq_len ? causal_end : src_seq_len;
+
+  float q_cache[kStorageDim];
+  float output_cache[kStorageDim];
+  for (int dim = 0; dim < head_dim; ++dim) {
+    q_cache[dim] = q[q_offset + dim];
+    output_cache[dim] = 0.0F;
+  }
+
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  float row_max = kNegativeFloatMax;
+  for (int key_pos = 0; key_pos < key_end; ++key_pos) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + key_pos) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      dot = fmaf(q_cache[dim], k[kv_offset + dim], dot);
+    }
+    row_max = fmaxf(row_max, dot * scale);
+  }
+
+  float row_sum = 0.0F;
+  for (int key_pos = 0; key_pos < key_end; ++key_pos) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + key_pos) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      dot = fmaf(q_cache[dim], k[kv_offset + dim], dot);
+    }
+    row_sum += expf(dot * scale - row_max);
+  }
+
+  const float inverse_sum = 1.0F / row_sum;
+  for (int key_pos = 0; key_pos < key_end; ++key_pos) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + key_pos) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      dot = fmaf(q_cache[dim], k[kv_offset + dim], dot);
+    }
+    const float probability = expf(dot * scale - row_max) * inverse_sum;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      output_cache[dim] =
+          fmaf(probability, v[kv_offset + dim], output_cache[dim]);
+    }
+  }
+
+  for (int dim = 0; dim < head_dim; ++dim) {
+    output[q_offset + dim] = output_cache[dim];
+  }
+}
+
+template <int HeadDim>
+__global__ void flashAttentionHalfOnlineKernel(
+    const half* __restrict__ q, const half* __restrict__ k,
+    const half* __restrict__ v, half* __restrict__ output, size_t query_rows,
+    int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
+    int runtime_head_dim, bool is_causal) {
+  const size_t query_row = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                           threadIdx.x;
+  if (query_row >= query_rows) {
+    return;
+  }
+
+  enum {
+    kStorageDim = HeadDim == 0 ? kMaxAttentionHeadDim : HeadDim
+  };
+  const int head_dim = HeadDim == 0 ? runtime_head_dim : HeadDim;
+  const size_t rows_per_batch =
+      static_cast<size_t>(target_seq_len) * query_heads;
+  const int batch = static_cast<int>(query_row / rows_per_batch);
+  const size_t row_in_batch =
+      query_row - static_cast<size_t>(batch) * rows_per_batch;
+  const int query_pos = static_cast<int>(row_in_batch / query_heads);
+  const int query_head = static_cast<int>(row_in_batch % query_heads);
+  const int kv_head = query_head / (query_heads / kv_heads);
+  const size_t q_offset = query_row * head_dim;
+  const int causal_end = query_pos + 1;
+  const int key_end =
+      is_causal && causal_end < src_seq_len ? causal_end : src_seq_len;
+
+  float q_cache[kStorageDim];
+  float output_cache[kStorageDim];
+  for (int dim = 0; dim < head_dim; ++dim) {
+    q_cache[dim] = toFloat(q[q_offset + dim]);
+    output_cache[dim] = 0.0F;
+  }
+
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  float running_max = kNegativeFloatMax;
+  float running_sum = 0.0F;
+  for (int key_pos = 0; key_pos < key_end; ++key_pos) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + key_pos) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      dot = fmaf(q_cache[dim], toFloat(k[kv_offset + dim]), dot);
+    }
+
+    const float score = dot * scale;
+    const float new_max = fmaxf(running_max, score);
+    const float previous_scale =
+        running_sum == 0.0F ? 0.0F : expf(running_max - new_max);
+    const float probability = expf(score - new_max);
+    running_sum = running_sum * previous_scale + probability;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      output_cache[dim] =
+          fmaf(probability, toFloat(v[kv_offset + dim]),
+               output_cache[dim] * previous_scale);
+    }
+    running_max = new_max;
+  }
+
+  const float inverse_sum = 1.0F / running_sum;
+  for (int dim = 0; dim < head_dim; ++dim) {
+    output[q_offset + dim] = fromFloat<half>(output_cache[dim] * inverse_sum);
+  }
+}
+
+template <int HeadDim>
+void launchFlashFloatSpecialization(
+    const float* q, const float* k, const float* v, float* output,
+    size_t query_rows, int target_seq_len, int src_seq_len, int query_heads,
+    int kv_heads, int runtime_head_dim, bool is_causal) {
+  const unsigned int blocks = static_cast<unsigned int>(
+      (query_rows + kAttentionBlockSize - 1) / kAttentionBlockSize);
+  flashAttentionFloatThreePassKernel<HeadDim>
+      <<<blocks, kAttentionBlockSize>>>(
+          q, k, v, output, query_rows, target_seq_len, src_seq_len,
+          query_heads, kv_heads, runtime_head_dim, is_causal);
+}
+
+template <int HeadDim>
+void launchFlashHalfSpecialization(
+    const half* q, const half* k, const half* v, half* output,
+    size_t query_rows, int target_seq_len, int src_seq_len, int query_heads,
+    int kv_heads, int runtime_head_dim, bool is_causal) {
+  const unsigned int blocks = static_cast<unsigned int>(
+      (query_rows + kAttentionBlockSize - 1) / kAttentionBlockSize);
+  flashAttentionHalfOnlineKernel<HeadDim><<<blocks, kAttentionBlockSize>>>(
+      q, k, v, output, query_rows, target_seq_len, src_seq_len, query_heads,
+      kv_heads, runtime_head_dim, is_causal);
+}
+
+void launchFlashAttention(const float* q, const float* k, const float* v,
+                          float* output, size_t query_rows,
+                          int target_seq_len, int src_seq_len,
+                          int query_heads, int kv_heads, int head_dim,
+                          bool is_causal) {
+#define LAUNCH_FLOAT_CASE(DIMENSION)                                          \
+  case DIMENSION:                                                             \
+    launchFlashFloatSpecialization<DIMENSION>(                                \
+        q, k, v, output, query_rows, target_seq_len, src_seq_len, query_heads, \
+        kv_heads, head_dim, is_causal);                                       \
+    break
+  switch (head_dim) {
+    LAUNCH_FLOAT_CASE(1);
+    LAUNCH_FLOAT_CASE(2);
+    LAUNCH_FLOAT_CASE(4);
+    LAUNCH_FLOAT_CASE(8);
+    LAUNCH_FLOAT_CASE(16);
+    LAUNCH_FLOAT_CASE(32);
+    LAUNCH_FLOAT_CASE(64);
+    default:
+      launchFlashFloatSpecialization<0>(
+          q, k, v, output, query_rows, target_seq_len, src_seq_len,
+          query_heads, kv_heads, head_dim, is_causal);
+      break;
+  }
+#undef LAUNCH_FLOAT_CASE
+}
+
+void launchFlashAttention(const half* q, const half* k, const half* v,
+                          half* output, size_t query_rows,
+                          int target_seq_len, int src_seq_len,
+                          int query_heads, int kv_heads, int head_dim,
+                          bool is_causal) {
+#define LAUNCH_HALF_CASE(DIMENSION)                                           \
+  case DIMENSION:                                                             \
+    launchFlashHalfSpecialization<DIMENSION>(                                 \
+        q, k, v, output, query_rows, target_seq_len, src_seq_len, query_heads, \
+        kv_heads, head_dim, is_causal);                                       \
+    break
+  switch (head_dim) {
+    LAUNCH_HALF_CASE(1);
+    LAUNCH_HALF_CASE(2);
+    LAUNCH_HALF_CASE(4);
+    LAUNCH_HALF_CASE(8);
+    LAUNCH_HALF_CASE(16);
+    LAUNCH_HALF_CASE(32);
+    LAUNCH_HALF_CASE(64);
+    default:
+      launchFlashHalfSpecialization<0>(
+          q, k, v, output, query_rows, target_seq_len, src_seq_len,
+          query_heads, kv_heads, head_dim, is_causal);
+      break;
+  }
+#undef LAUNCH_HALF_CASE
+}
+
+}  // namespace
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -23,14 +366,56 @@
  */
 template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
-              std::vector<T>& h_output, size_t rows, size_t hidden_dim,
-              float eps) {
-  // TODO: Implement the rmsNorm function
+             std::vector<T>& h_output, size_t rows, size_t hidden_dim,
+             float eps) {
+  if (rows == 0 || hidden_dim == 0) {
+    h_output.clear();
+    return;
+  }
+  if (rows > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+    throw std::overflow_error("RMSNorm row grid exceeds one-dimensional limit");
+  }
+
+  const size_t element_count =
+      checkedMultiply(rows, hidden_dim, "RMSNorm element count overflow");
+  if (h_input.size() < element_count || h_weight.size() < hidden_dim) {
+    throw std::invalid_argument("RMSNorm input vector is smaller than its shape");
+  }
+  if (h_output.size() != element_count) {
+    h_output.resize(element_count);
+  }
+
+  const size_t input_bytes =
+      checkedMultiply(element_count, sizeof(T), "RMSNorm input size overflow");
+  const size_t weight_bytes =
+      checkedMultiply(hidden_dim, sizeof(T), "RMSNorm weight size overflow");
+  const size_t output_bytes = input_bytes;
+  const size_t weight_offset = alignDeviceOffset(input_bytes);
+  const size_t output_offset = alignDeviceOffset(checkedAdd(
+      weight_offset, weight_bytes, "RMSNorm allocation size overflow"));
+  const size_t allocation_bytes = checkedAdd(
+      output_offset, output_bytes, "RMSNorm allocation size overflow");
+
+  unsigned char* storage = nullptr;
+  RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&storage), allocation_bytes));
+  T* d_input = reinterpret_cast<T*>(storage);
+  T* d_weight = reinterpret_cast<T*>(storage + weight_offset);
+  T* d_output = reinterpret_cast<T*>(storage + output_offset);
+
+  RUNTIME_CHECK(
+      mcMemcpy(d_input, h_input.data(), input_bytes, mcMemcpyHostToDevice));
+  RUNTIME_CHECK(
+      mcMemcpy(d_weight, h_weight.data(), weight_bytes, mcMemcpyHostToDevice));
+  launchRmsNorm(d_input, d_weight, d_output, rows, hidden_dim, eps);
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(
+      mcMemcpy(h_output.data(), d_output, output_bytes, mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(mcFree(storage));
 }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -38,7 +423,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -47,9 +432,92 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim,
+                    bool is_causal) {
+  if (batch_size < 0 || target_seq_len < 0 || src_seq_len < 0 ||
+      query_heads < 0 || kv_heads < 0 || head_dim < 0) {
+    throw std::invalid_argument("attention dimensions must be non-negative");
+  }
+  if (batch_size == 0 || target_seq_len == 0 || query_heads == 0 ||
+      head_dim == 0) {
+    h_o.clear();
+    return;
+  }
+  if (kv_heads == 0 || query_heads % kv_heads != 0) {
+    throw std::invalid_argument(
+        "query_heads must be divisible by non-zero kv_heads");
+  }
+  if (head_dim > kMaxAttentionHeadDim) {
+    throw std::invalid_argument("head_dim exceeds supported maximum of 256");
+  }
+
+  size_t query_rows = checkedMultiply(static_cast<size_t>(batch_size),
+                                      static_cast<size_t>(target_seq_len),
+                                      "attention query row count overflow");
+  query_rows = checkedMultiply(query_rows, static_cast<size_t>(query_heads),
+                               "attention query row count overflow");
+  const size_t query_count = checkedMultiply(
+      query_rows, static_cast<size_t>(head_dim),
+      "attention query element count overflow");
+  size_t kv_count = checkedMultiply(static_cast<size_t>(batch_size),
+                                    static_cast<size_t>(src_seq_len),
+                                    "attention key/value count overflow");
+  kv_count = checkedMultiply(kv_count, static_cast<size_t>(kv_heads),
+                             "attention key/value count overflow");
+  kv_count = checkedMultiply(kv_count, static_cast<size_t>(head_dim),
+                             "attention key/value count overflow");
+
+  if (h_q.size() < query_count || h_k.size() < kv_count ||
+      h_v.size() < kv_count) {
+    throw std::invalid_argument(
+        "attention input vector is smaller than its shape");
+  }
+  if (h_o.size() != query_count) {
+    h_o.resize(query_count);
+  }
+  if (src_seq_len == 0) {
+    std::fill(h_o.begin(), h_o.end(), T{});
+    return;
+  }
+
+  const size_t maximum_grid_rows =
+      checkedMultiply(static_cast<size_t>(std::numeric_limits<unsigned int>::max()),
+                      static_cast<size_t>(kAttentionBlockSize),
+                      "attention grid size overflow");
+  if (query_rows > maximum_grid_rows) {
+    throw std::overflow_error("attention query grid exceeds one-dimensional limit");
+  }
+
+  const size_t query_bytes = checkedMultiply(
+      query_count, sizeof(T), "attention query byte size overflow");
+  const size_t kv_bytes = checkedMultiply(
+      kv_count, sizeof(T), "attention key/value byte size overflow");
+  const size_t key_offset = alignDeviceOffset(query_bytes);
+  const size_t value_offset = alignDeviceOffset(checkedAdd(
+      key_offset, kv_bytes, "attention allocation size overflow"));
+  const size_t output_offset = alignDeviceOffset(checkedAdd(
+      value_offset, kv_bytes, "attention allocation size overflow"));
+  const size_t allocation_bytes = checkedAdd(
+      output_offset, query_bytes, "attention allocation size overflow");
+
+  unsigned char* storage = nullptr;
+  RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&storage), allocation_bytes));
+  T* d_q = reinterpret_cast<T*>(storage);
+  T* d_k = reinterpret_cast<T*>(storage + key_offset);
+  T* d_v = reinterpret_cast<T*>(storage + value_offset);
+  T* d_o = reinterpret_cast<T*>(storage + output_offset);
+
+  RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), query_bytes, mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), kv_bytes, mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), kv_bytes, mcMemcpyHostToDevice));
+  launchFlashAttention(d_q, d_k, d_v, d_o, query_rows, target_seq_len,
+                       src_seq_len, query_heads, kv_heads, head_dim,
+                       is_causal);
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(
+      mcMemcpy(h_o.data(), d_o, query_bytes, mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(mcFree(storage));
 }
 
 // *********************************************************************
